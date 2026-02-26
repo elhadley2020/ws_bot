@@ -12,14 +12,25 @@ INSTR = ["EUR_USD","GBP_USD","USD_JPY"]
 EMA, RSI, ATR = 50, 14, 14
 RISK, MAXU, COOLD = 0.01, 100000, 300
 LOG="trades.csv"
+DASH_INTERVAL = 5  # seconds
 
 # ================= STATE =================
 state = {
     "price": {p: pd.DataFrame(columns=["time","open","high","low","close"]) for p in INSTR},
     "last": {p: 0 for p in INSTR},
     "pos": {p: 0 for p in INSTR},
-    "locks": {p: asyncio.Lock() for p in INSTR}  # per-instrument lock
+    "entry": {p: 0.0 for p in INSTR},
+    "last_signal": {p: 0 for p in INSTR},
+    "locks": {p: asyncio.Lock() for p in INSTR}
 }
+
+# ================= COLORS =================
+GREEN = "\033[92m"
+RED = "\033[91m"
+YELLOW = "\033[93m"
+BLUE = "\033[94m"
+MAGENTA = "\033[95m"
+RESET = "\033[0m"
 
 # ================= UTILITIES =================
 def add_ind(df):
@@ -74,7 +85,9 @@ async def place_order(session, pair, units, stop, tp):
     async with session.post(f"{REST}/accounts/{ACCOUNT_ID}/orders", json=payload) as r:
         res = await r.json()
         if "orderFillTransaction" in res:
-            print(f"{datetime.now()} | Order filled: {pair} {units} units | Price: {res['orderFillTransaction']['price']}")
+            price_filled = float(res['orderFillTransaction']['price'])
+            state['entry'][pair] = price_filled
+            print(f"{datetime.now()} | Order filled: {pair} {units} units | Price: {price_filled}")
         else:
             print(f"{datetime.now()} | Order NOT filled! Response: {res}")
         return res
@@ -90,10 +103,10 @@ async def refresh_positions(session):
                 open_pos[instrument] = 1 if units > 0 else -1
         state['pos'].update(open_pos)
 
-# ================= PROCESS TICK (PER INSTRUMENT) =================
+# ================= PROCESS TICK =================
 async def process_tick(session, tick):
     pair = tick['instrument']
-    async with state['locks'][pair]:  # prevent race conditions per pair
+    async with state['locks'][pair]:
         await refresh_positions(session)
         bid = float(tick['bids'][0]['price'])
         ask = float(tick['asks'][0]['price'])
@@ -115,6 +128,7 @@ async def process_tick(session, tick):
         if len(df) < ATR + 10: return
         df = add_ind(df)
         sig = signal(df)
+        state['last_signal'][pair] = sig
         if sig == 0 or state['pos'][pair] != 0 or (datetime.utcnow().timestamp()-state['last'][pair]) < COOLD: return
 
         nav = await get_nav(session)
@@ -130,24 +144,46 @@ async def process_tick(session, tick):
         state['pos'][pair] = sig
         log_trade(pair, units, sig, price)
 
+# ================= DASHBOARD =================
+async def dashboard():
+    while True:
+        os.system("clear")
+        print(f"{'PAIR':6} | {'POS':3} | {'ENTRY':10} | {'LAST':10} | {'PNL':10} | {'SIGNAL':6}")
+        print("-"*65)
+        for pair in INSTR:
+            pos = state['pos'][pair]
+            entry = state['entry'][pair]
+            last_price = state['price'][pair]['close'].iloc[-1] if not state['price'][pair].empty else 0
+            pnl = (last_price - entry) * pos
+            if "JPY" in pair: pnl *= 100
+
+            # Color PnL
+            pnl_color = GREEN if pnl>0 else RED if pnl<0 else YELLOW
+            # Color signal
+            sig = state['last_signal'][pair]
+            sig_color = BLUE if sig==1 else MAGENTA if sig==-1 else YELLOW
+
+            print(f"{pair:6} | {pos:3} | {entry:10.5f} | {last_price:10.5f} | {pnl_color}{pnl:10.2f}{RESET} | {sig_color}{sig:6}{RESET}")
+        await asyncio.sleep(DASH_INTERVAL)
+
 # ================= STREAM =================
 async def stream_prices():
     headers = {"Authorization": f"Bearer {API_KEY}"}
     params = {"instruments": ",".join(INSTR)}
-    while True:
-        try:
-            async with aiohttp.ClientSession(headers=headers) as session:
+    async with aiohttp.ClientSession(headers=headers) as session:
+        asyncio.create_task(dashboard())
+        while True:
+            try:
                 async with session.get(STREAM, params=params) as r:
                     print("Streaming connected...")
                     async for line in r.content:
                         if not line: continue
                         data = json.loads(line.decode("utf-8"))
                         if "bids" in data:
-                            # Schedule per-instrument tasks
                             asyncio.create_task(process_tick(session, data))
-        except Exception as e:
-            print("Stream error:", e)
-            await asyncio.sleep(5)
+            except Exception as e:
+                print("Stream error:", e)
+                await asyncio.sleep(5)
 
 # ================= MAIN =================
 if __name__=="__main__":
