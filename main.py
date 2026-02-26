@@ -8,19 +8,25 @@ API_KEY = os.getenv("OANDA_API_KEY")
 ACCOUNT_ID = os.getenv("OANDA_ACCOUNT_ID")
 REST = "https://api-fxpractice.oanda.com/v3"
 STREAM = f"https://stream-fxpractice.oanda.com/v3/accounts/{ACCOUNT_ID}/pricing/stream"
+
+# Instruments to trade
 INSTR = ["EUR_USD","GBP_USD","USD_JPY","USD_CHF","AUD_USD","USD_CAD"]
+
+# Indicators and risk
 EMA, RSI, ATR = 50, 14, 14
-RISK, MAXU, COOLD = 0.01, 100000, 300
-LOG="trades.csv"
-DASH_INTERVAL = 5  # seconds
+RISK_PER_TRADE = 0.01  # 1% of NAV
+SL_MULTIPLIER = 1.5
+TP_MULTIPLIER = 3
+DASH_INTERVAL = 5  # seconds for dashboard refresh
+COOLDOWN = 300  # seconds between trades per pair
 
 # ================= STATE =================
 state = {
     "price": {p: pd.DataFrame(columns=["time","open","high","low","close"]) for p in INSTR},
-    "last": {p: 0 for p in INSTR},
+    "last_signal": {p: 0 for p in INSTR},
     "pos": {p: 0 for p in INSTR},
     "entry": {p: 0.0 for p in INSTR},
-    "last_signal": {p: 0 for p in INSTR},
+    "last_trade_time": {p: 0 for p in INSTR},
     "locks": {p: asyncio.Lock() for p in INSTR}
 }
 
@@ -33,14 +39,14 @@ MAGENTA = "\033[95m"
 RESET = "\033[0m"
 
 # ================= UTILITIES =================
-def add_ind(df):
+def add_indicators(df):
     df['ema'] = df['close'].ewm(span=EMA, adjust=False).mean()
-    d = df['close'].diff()
-    g = d.clip(lower=0)
-    l = -d.clip(upper=0)
-    ag = g.ewm(alpha=1/RSI, adjust=False).mean()
-    al = l.ewm(alpha=1/RSI, adjust=False).mean()
-    df['rsi'] = 100-(100/(1+ag/al))
+    delta = df['close'].diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1/RSI, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1/RSI, adjust=False).mean()
+    df['rsi'] = 100-(100/(1+avg_gain/avg_loss))
     df['prev_close'] = df['close'].shift(1)
     df['tr'] = np.maximum(df['high']-df['low'],
                           np.maximum(abs(df['high']-df['prev_close']),
@@ -48,38 +54,49 @@ def add_ind(df):
     df['atr'] = df['tr'].rolling(ATR).mean()
     return df
 
-def signal(df):
-    l = df.iloc[-1]
-    if l['close'] > l['ema'] and l['rsi'] > 55: return 1
-    if l['close'] < l['ema'] and l['rsi'] < 45: return -1
+def get_signal(df):
+    last = df.iloc[-1]
+    if last['close'] > last['ema'] and last['rsi'] > 55:
+        return 1
+    if last['close'] < last['ema'] and last['rsi'] < 45:
+        return -1
     return 0
 
-def calc_units(nav, atr): return max(int(min(nav*RISK/(1.5*atr), MAXU)),0)
-def fmt(price, pair): return f"{price:.3f}" if "JPY" in pair else f"{price:.5f}"
-def log_trade(pair, units, sig, price):
-    pd.DataFrame([[datetime.now(), pair, units, sig, price]],
-                 columns=["time","pair","units","signal","price"])\
-      .to_csv(LOG, mode="a", header=not os.path.exists(LOG), index=False)
+def calculate_units(nav, margin_avail, atr, risk=RISK_PER_TRADE):
+    units = int((nav * risk) / (SL_MULTIPLIER * atr))
+    units = min(units, int(margin_avail))
+    return max(units, 0)
 
-# ================= REST CALLS =================
-async def get_nav(session):
+def fmt_price(price, pair):
+    return f"{price:.3f}" if "JPY" in pair else f"{price:.5f}"
+
+# ================= REST FUNCTIONS =================
+async def get_account_info(session):
     async with session.get(f"{REST}/accounts/{ACCOUNT_ID}/summary") as r:
-        return float((await r.json())['account']['NAV'])
+        data = await r.json()
+        nav = float(data['account']['NAV'])
+        margin_avail = float(data['account']['marginAvailable'])
+        return nav, margin_avail
 
-async def place_order(session, pair, units, stop, tp):
-    if units == 0: return None
-    precision = 3 if "JPY" in pair else 5
-    stop = round(float(stop), precision)
-    tp = round(float(tp), precision)
+async def place_order(session, pair, price, atr, signal):
+    nav, margin_avail = await get_account_info(session)
+    units = calculate_units(nav, margin_avail, atr, RISK_PER_TRADE)
+    if units == 0:
+        print(f"{datetime.now()} | Skipping {pair}, not enough margin")
+        return
+
+    stop_loss = price - SL_MULTIPLIER*atr if signal==1 else price + SL_MULTIPLIER*atr
+    take_profit = price + TP_MULTIPLIER*atr if signal==1 else price - TP_MULTIPLIER*atr
+
     payload = {
         "order": {
             "instrument": pair,
-            "units": str(units),
+            "units": str(units if signal==1 else -units),
             "type": "MARKET",
-            "timeInForce": "GTC",
+            "timeInForce": "FOK",
             "positionFill": "DEFAULT",
-            "stopLossOnFill": {"price": str(stop)},
-            "takeProfitOnFill": {"price": str(tp)}
+            "stopLossOnFill": {"price": fmt_price(stop_loss, pair)},
+            "takeProfitOnFill": {"price": fmt_price(take_profit, pair)}
         }
     }
     async with session.post(f"{REST}/accounts/{ACCOUNT_ID}/orders", json=payload) as r:
@@ -87,62 +104,11 @@ async def place_order(session, pair, units, stop, tp):
         if "orderFillTransaction" in res:
             price_filled = float(res['orderFillTransaction']['price'])
             state['entry'][pair] = price_filled
-            print(f"{datetime.now()} | Order filled: {pair} {units} units | Price: {price_filled}")
+            state['pos'][pair] = signal
+            state['last_trade_time'][pair] = datetime.utcnow().timestamp()
+            print(f"{datetime.now()} | Order filled: {pair} {units} units at {price_filled}")
         else:
-            print(f"{datetime.now()} | Order NOT filled! Response: {res}")
-        return res
-
-async def refresh_positions(session):
-    async with session.get(f"{REST}/accounts/{ACCOUNT_ID}/openPositions") as r:
-        data = await r.json()
-        open_pos = {p:0 for p in INSTR}
-        for pos in data.get('positions', []):
-            instrument = pos['instrument']
-            units = int(float(pos['long']['units']) - float(pos['short']['units']))
-            if units != 0:
-                open_pos[instrument] = 1 if units > 0 else -1
-        state['pos'].update(open_pos)
-
-# ================= PROCESS TICK =================
-async def process_tick(session, tick):
-    pair = tick['instrument']
-    async with state['locks'][pair]:
-        await refresh_positions(session)
-        bid = float(tick['bids'][0]['price'])
-        ask = float(tick['asks'][0]['price'])
-        price = (bid + ask)/2
-
-        df = state['price'][pair]
-        now = pd.Timestamp.now(tz="UTC").floor("min")
-
-        if not df.empty and df['time'].iloc[-1] == now:
-            df.at[df.index[-1], 'high'] = max(df['high'].iloc[-1], price)
-            df.at[df.index[-1], 'low'] = min(df['low'].iloc[-1], price)
-            df.at[df.index[-1], 'close'] = price
-        else:
-            new_row = pd.DataFrame([[now, price, price, price, price]],
-                                   columns=["time","open","high","low","close"])
-            df = pd.concat([df, new_row], ignore_index=True)
-        state['price'][pair] = df.tail(200)
-
-        if len(df) < ATR + 10: return
-        df = add_ind(df)
-        sig = signal(df)
-        state['last_signal'][pair] = sig
-        if sig == 0 or state['pos'][pair] != 0 or (datetime.utcnow().timestamp()-state['last'][pair]) < COOLD: return
-
-        nav = await get_nav(session)
-        atr = df['atr'].iloc[-1]
-        units = calc_units(nav, atr)
-        if units == 0: return
-
-        stop = price-1.5*atr if sig==1 else price+1.5*atr
-        tp = price+3*atr if sig==1 else price-3*atr
-
-        await place_order(session, pair, units if sig==1 else -units, stop, tp)
-        state['last'][pair] = datetime.utcnow().timestamp()
-        state['pos'][pair] = sig
-        log_trade(pair, units, sig, price)
+            print(f"{datetime.now()} | Order rejected: {pair}, Response: {res}")
 
 # ================= DASHBOARD =================
 async def dashboard():
@@ -154,19 +120,43 @@ async def dashboard():
             pos = state['pos'][pair]
             entry = state['entry'][pair]
             last_price = state['price'][pair]['close'].iloc[-1] if not state['price'][pair].empty else 0
-            pnl = (last_price - entry) * pos
+            pnl = (last_price - entry)*pos
             if "JPY" in pair: pnl *= 100
-
-            # Color PnL
             pnl_color = GREEN if pnl>0 else RED if pnl<0 else YELLOW
-            # Color signal
             sig = state['last_signal'][pair]
             sig_color = BLUE if sig==1 else MAGENTA if sig==-1 else YELLOW
-
             print(f"{pair:6} | {pos:3} | {entry:10.5f} | {last_price:10.5f} | {pnl_color}{pnl:10.2f}{RESET} | {sig_color}{sig:6}{RESET}")
         await asyncio.sleep(DASH_INTERVAL)
 
-# ================= STREAM =================
+# ================= STREAM PROCESS =================
+async def process_tick(session, tick):
+    pair = tick['instrument']
+    async with state['locks'][pair]:
+        bid = float(tick['bids'][0]['price'])
+        ask = float(tick['asks'][0]['price'])
+        price = (bid+ask)/2
+
+        df = state['price'][pair]
+        now = pd.Timestamp.now(tz="UTC").floor("min")
+        if not df.empty and df['time'].iloc[-1]==now:
+            df.at[df.index[-1],'high'] = max(df['high'].iloc[-1], price)
+            df.at[df.index[-1],'low'] = min(df['low'].iloc[-1], price)
+            df.at[df.index[-1],'close'] = price
+        else:
+            new_row = pd.DataFrame([[now, price, price, price, price]], columns=["time","open","high","low","close"])
+            df = pd.concat([df, new_row], ignore_index=True)
+        state['price'][pair] = df.tail(200)
+
+        if len(df)<ATR+10: return
+        df = add_indicators(df)
+        sig = get_signal(df)
+        state['last_signal'][pair] = sig
+
+        # Only trade if signal exists, no current position, and cooldown passed
+        if sig!=0 and state['pos'][pair]==0 and (datetime.utcnow().timestamp()-state['last_trade_time'][pair])>COOLDOWN:
+            await place_order(session, pair, price, df['atr'].iloc[-1], sig)
+
+# ================= STREAM PRICES =================
 async def stream_prices():
     headers = {"Authorization": f"Bearer {API_KEY}"}
     params = {"instruments": ",".join(INSTR)}
@@ -174,7 +164,8 @@ async def stream_prices():
         asyncio.create_task(dashboard())
         while True:
             try:
-                async with session.get(STREAM, params=params) as r:
+                async with session.get(f"https://stream-fxpractice.oanda.com/v3/accounts/{ACCOUNT_ID}/pricing/stream",
+                                       params=params) as r:
                     print("Streaming connected...")
                     async for line in r.content:
                         if not line: continue
