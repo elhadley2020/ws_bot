@@ -1,6 +1,5 @@
-websocket-client
-requests
 pandas 
 numpy 
-backoff 
 python-dotenv
+asyncio 
+aiohttp
