@@ -20,10 +20,12 @@ SL_MULTIPLIER = 1.5
 TP_MULTIPLIER = 3
 COOLDOWN = 4  # in candles
 TIMEFRAME = "15min"  # main timeframe for trend
+TIMEFRAME_LONG = "1H"  # Higher timeframe for trend confirmation
 
 # ================= STATE =================
 state = {
     "price": {p: pd.DataFrame(columns=["time","open","high","low","close"]) for p in INSTR},
+    "price_1h": {p: pd.DataFrame(columns=["time","open","high","low","close"]) for p in INSTR},
     "last_signal": {p: 0 for p in INSTR},
     "pos": {p: 0 for p in INSTR},
     "entry": {p: 0.0 for p in INSTR},
@@ -58,16 +60,38 @@ def add_indicators(df):
 
     return df
 
-def get_signal(df):
-    last = df.iloc[-1]
+def is_trending(df):
+    # Calculate the slope of EMA50 and EMA200
+    ema50_slope = df['ema50'].diff().iloc[-1]  # Change in EMA50 over the last period
+    ema200_slope = df['ema200'].diff().iloc[-1]  # Change in EMA200 over the last period
     
-    # Long signal: MACD crosses above signal line, EMA50 above EMA200, RSI > 50
-    if last['macd_line'] > last['macd_signal'] and last['ema50'] > last['ema200'] and last['rsi'] > 50:
-        return 1  # long
+    # Check if both EMAs are flat (low slope), which typically indicates sideways movement
+    if abs(ema50_slope) < 0.00001 and abs(ema200_slope) < 0.00001:
+        return False  # Flat EMAs, avoid trade
+    
+    return True  # Trending market
 
-    # Short signal: MACD crosses below signal line, EMA50 below EMA200, RSI < 50
-    elif last['macd_line'] < last['macd_signal'] and last['ema50'] < last['ema200'] and last['rsi'] < 50:
-        return -1  # short
+def is_sideways(df, period=6):
+    """Check if price has been moving in a narrow range for a set period"""
+    price_range = df['high'].max() - df['low'].min()
+    return price_range < 0.0005  # Adjust this threshold based on your asset's volatility
+
+def get_signal(df_15min, df_1h):
+    last_15min = df_15min.iloc[-1]
+    last_1h = df_1h.iloc[-1]
+    
+    # Sideways check: Avoid trading if price has been range-bound for multiple candles
+    if is_sideways(df_15min, period=6) or last_15min['atr'] < 0.0005 or not is_trending(df_15min):
+        return 0  # No trade (sideways market or low ATR)
+    
+    # Long and short signals based on MACD, EMA, and RSI for trend confirmation
+    if last_15min['macd_line'] > last_15min['macd_signal'] and last_15min['ema50'] > last_15min['ema200'] and last_15min['rsi'] > 50:
+        if last_1h['macd_line'] > last_1h['macd_signal'] and last_1h['ema50'] > last_1h['ema200']:  # 1-hour confirmation
+            return 1  # long
+    
+    elif last_15min['macd_line'] < last_15min['macd_signal'] and last_15min['ema50'] < last_15min['ema200'] and last_15min['rsi'] < 50:
+        if last_1h['macd_line'] < last_1h['macd_signal'] and last_1h['ema50'] < last_1h['ema200']:  # 1-hour confirmation
+            return -1  # short
     
     return 0  # no trade
 
@@ -131,27 +155,40 @@ async def process_tick(session, tick):
     async with state['locks'][pair]:
         bid = float(tick['bids'][0]['price'])
         ask = float(tick['asks'][0]['price'])
-        price = (bid+ask)/2
+        price = (bid + ask) / 2
 
-        df = state['price'][pair]
+        # Update 15min data
+        df_15min = state['price'][pair]
         now = pd.Timestamp.now(tz="UTC").floor("min")
-        if not df.empty and df['time'].iloc[-1]==now:
-            df.at[df.index[-1],'high'] = max(df['high'].iloc[-1], price)
-            df.at[df.index[-1],'low'] = min(df['low'].iloc[-1], price)
-            df.at[df.index[-1],'close'] = price
+        if not df_15min.empty and df_15min['time'].iloc[-1] == now:
+            df_15min.at[df_15min.index[-1], 'high'] = max(df_15min['high'].iloc[-1], price)
+            df_15min.at[df_15min.index[-1], 'low'] = min(df_15min['low'].iloc[-1], price)
+            df_15min.at[df_15min.index[-1], 'close'] = price
         else:
-            new_row = pd.DataFrame([[now, price, price, price, price]], columns=["time","open","high","low","close"])
-            df = pd.concat([df,new_row], ignore_index=True)
-        state['price'][pair] = df.tail(300)
+            new_row = pd.DataFrame([[now, price, price, price, price]], columns=["time", "open", "high", "low", "close"])
+            df_15min = pd.concat([df_15min, new_row], ignore_index=True)
+        state['price'][pair] = df_15min.tail(300)
 
-        if len(df)<ATR_PERIOD+10: return
-        df = add_indicators(df)
-        sig = get_signal(df)
+        # Update 1-hour data
+        df_1h = state['price_1h'][pair]
+        if not df_1h.empty and df_1h['time'].iloc[-1] == now:
+            df_1h.at[df_1h.index[-1], 'high'] = max(df_1h['high'].iloc[-1], price)
+            df_1h.at[df_1h.index[-1], 'low'] = min(df_1h['low'].iloc[-1], price)
+            df_1h.at[df_1h.index[-1], 'close'] = price
+        else:
+            new_row = pd.DataFrame([[now, price, price, price, price]], columns=["time", "open", "high", "low", "close"])
+            df_1h = pd.concat([df_1h, new_row], ignore_index=True)
+        state['price_1h'][pair] = df_1h.tail(300)
+
+        # Add indicators and get signals for both timeframes
+        df_15min = add_indicators(df_15min)
+        df_1h = add_indicators(df_1h)
+        sig = get_signal(df_15min, df_1h)
         state['last_signal'][pair] = sig
 
         # Trade only if no position and cooldown passed
-        if sig!=0 and state['pos'][pair]==0 and (datetime.utcnow().timestamp()-state['last_trade_time'][pair])>COOLDOWN*60:
-            await place_order(session,pair,price,df['atr'].iloc[-1],sig)
+        if sig != 0 and state['pos'][pair] == 0 and (datetime.utcnow().timestamp() - state['last_trade_time'][pair]) > COOLDOWN * 60:
+            await place_order(session, pair, price, df_15min['atr'].iloc[-1], sig)
 
 # ================= STREAM PRICES =================
 async def stream_prices():
@@ -167,11 +204,11 @@ async def stream_prices():
                         if not line: continue
                         data = json.loads(line.decode("utf-8"))
                         if "bids" in data:
-                            asyncio.create_task(process_tick(session, data))
+                            asyncio.create_task(process_tick(session,data))
             except Exception as e:
                 print("Stream error:", e)
                 await asyncio.sleep(5)
 
 # ================= MAIN =================
-if __name__ == "__main__":
+if __name__=="__main__":
     asyncio.run(stream_prices())
