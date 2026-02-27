@@ -24,8 +24,8 @@ TIMEFRAME_LONG = "1H"  # Higher timeframe for trend confirmation
 
 # ================= STATE =================
 state = {
-    "price": {p: pd.DataFrame(columns=["time","open","high","low","close"]) for p in INSTR},
-    "price_1h": {p: pd.DataFrame(columns=["time","open","high","low","close"]) for p in INSTR},
+    "price": {p: pd.DataFrame(columns=["time", "open", "high", "low", "close"]) for p in INSTR},
+    "price_1h": {p: pd.DataFrame(columns=["time", "open", "high", "low", "close"]) for p in INSTR},
     "last_signal": {p: 0 for p in INSTR},
     "pos": {p: 0 for p in INSTR},
     "entry": {p: 0.0 for p in INSTR},
@@ -35,6 +35,11 @@ state = {
 
 # ================= INDICATORS =================
 def add_indicators(df):
+    # Fill NaN values with forward fill (or backward fill if preferred)
+    df['high'] = df['high'].fillna(method='ffill')
+    df['low'] = df['low'].fillna(method='ffill')
+    df['prev_close'] = df['prev_close'].fillna(method='ffill')
+    
     # EMA calculation
     df['ema50'] = df['close'].ewm(span=EMA_FAST, adjust=False).mean()
     df['ema200'] = df['close'].ewm(span=EMA_SLOW, adjust=False).mean()
@@ -45,15 +50,15 @@ def add_indicators(df):
     loss = -delta.clip(upper=0)
     avg_gain = gain.ewm(alpha=1/RSI_PERIOD, adjust=False).mean()
     avg_loss = loss.ewm(alpha=1/RSI_PERIOD, adjust=False).mean()
-    df['rsi'] = 100-(100/(1+avg_gain/avg_loss))
+    df['rsi'] = 100 - (100 / (1 + avg_gain / avg_loss))
 
     # ATR calculation
     df['prev_close'] = df['close'].shift(1)
-    df['tr'] = np.maximum(df['high']-df['low'],
-                          np.maximum(abs(df['high']-df['prev_close']),
-                                     abs(df['low']-df['prev_close'])))
+    df['tr'] = np.maximum(df['high'] - df['low'],
+                          np.maximum(abs(df['high'] - df['prev_close']),
+                                     abs(df['low'] - df['prev_close'])))
     df['atr'] = df['tr'].rolling(ATR_PERIOD).mean()
-    
+
     # MACD calculation
     df['macd_line'] = df['close'].ewm(span=12, adjust=False).mean() - df['close'].ewm(span=26, adjust=False).mean()
     df['macd_signal'] = df['macd_line'].ewm(span=9, adjust=False).mean()
@@ -119,23 +124,23 @@ async def place_order(session, pair, price, atr, signal):
         print(f"{datetime.now()} | Skipping {pair}, insufficient margin")
         return
 
-    stop_loss = price - SL_MULTIPLIER*atr if signal==1 else price + SL_MULTIPLIER*atr
-    take_profit = price + TP_MULTIPLIER*atr if signal==1 else price - TP_MULTIPLIER*atr
+    stop_loss = price - SL_MULTIPLIER * atr if signal == 1 else price + SL_MULTIPLIER * atr
+    take_profit = price + TP_MULTIPLIER * atr if signal == 1 else price - TP_MULTIPLIER * atr
 
     # Ensure minimum SL/TP distance
     min_dist = 0.01 if "JPY" in pair else 0.0001
-    if abs(price-stop_loss) < min_dist: stop_loss = price + (min_dist if signal==-1 else -min_dist)
-    if abs(price-take_profit) < min_dist: take_profit = price + (3*min_dist if signal==1 else -3*min_dist)
+    if abs(price - stop_loss) < min_dist: stop_loss = price + (min_dist if signal == -1 else -min_dist)
+    if abs(price - take_profit) < min_dist: take_profit = price + (3 * min_dist if signal == 1 else -3 * min_dist)
 
     payload = {
         "order": {
             "instrument": pair,
-            "units": str(units if signal==1 else -units),
+            "units": str(units if signal == 1 else -units),
             "type": "MARKET",
             "timeInForce": "IOC",
             "positionFill": "DEFAULT",
-            "stopLossOnFill": {"price": fmt_price(stop_loss,pair)},
-            "takeProfitOnFill": {"price": fmt_price(take_profit,pair)}
+            "stopLossOnFill": {"price": fmt_price(stop_loss, pair)},
+            "takeProfitOnFill": {"price": fmt_price(take_profit, pair)}
         }
     }
     async with session.post(f"{REST}/accounts/{ACCOUNT_ID}/orders", json=payload) as r:
@@ -204,11 +209,11 @@ async def stream_prices():
                         if not line: continue
                         data = json.loads(line.decode("utf-8"))
                         if "bids" in data:
-                            asyncio.create_task(process_tick(session,data))
+                            asyncio.create_task(process_tick(session, data))
             except Exception as e:
                 print("Stream error:", e)
                 await asyncio.sleep(5)
 
 # ================= MAIN =================
-if __name__=="__main__":
+if __name__ == "__main__":
     asyncio.run(stream_prices())
