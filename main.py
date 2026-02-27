@@ -11,6 +11,9 @@ from dotenv import load_dotenv
 load_dotenv()
 API_KEY = os.getenv("OANDA_API_KEY")
 ACCOUNT_ID = os.getenv("OANDA_ACCOUNT_ID")
+
+# Correct streaming URL for practice account
+STREAM = f"https://stream-fxpractice.oanda.com/v3/accounts/{ACCOUNT_ID}/pricing/stream"
 REST = "https://api-fxpractice.oanda.com/v3"
 
 # Instruments
@@ -70,7 +73,6 @@ def get_signal(df):
     return 0
 
 def get_trend_signal(df):
-    """Higher timeframe trend: returns 1=up, -1=down, 0=neutral"""
     if len(df) < EMA_SLOW:
         return 0
     last = df.iloc[-1]
@@ -136,7 +138,7 @@ async def process_tick(session, tick):
         ask = float(tick['asks'][0]['price'])
         price = (bid + ask)/2
 
-        # --- Update 5-min candles ---
+        # Update 5-min candles
         df = state['price'][pair]
         now = pd.Timestamp.now(tz="UTC").floor("min")
         if not df.empty and df['time'].iloc[-1] == now:
@@ -149,7 +151,7 @@ async def process_tick(session, tick):
         df.name = pair
         state['price'][pair] = df.tail(300)
 
-        # --- Update 15-min trend candles ---
+        # Update 15-min trend candles
         trend_df = state['trend'][pair]
         trend_now = pd.Timestamp.now(tz="UTC").floor("15min")
         if not trend_df.empty and trend_df['time'].iloc[-1] == trend_now:
@@ -162,16 +164,15 @@ async def process_tick(session, tick):
         trend_df.name = pair
         state['trend'][pair] = trend_df.tail(300)
 
-        # --- Indicators ---
+        # Indicators
         if len(df) < ATR_PERIOD+10 or len(trend_df) < EMA_SLOW:
             return
-
         df = add_indicators(df)
         trend_df = add_indicators(trend_df)
         sig = get_signal(df)
         trend_sig = get_trend_signal(trend_df)
 
-        # --- Trade only if trend aligned ---
+        # Trade only if trend aligned
         if sig != 0 and sig == trend_sig and state['pos'][pair]==0 and (datetime.utcnow().timestamp() - state['last_trade_time'][pair]) > COOLDOWN*60:
             await place_order(session, pair, price, df['atr'].iloc[-1], sig)
 
@@ -185,8 +186,7 @@ async def stream_prices():
         while True:
             try:
                 print("Connecting to OANDA stream...")
-                async with session.get(f"{REST}/accounts/{ACCOUNT_ID}/pricing/stream",
-                                       params=params) as resp:
+                async with session.get(STREAM, params=params) as resp:
                     if resp.status != 200:
                         print(f"Stream error: HTTP {resp.status}, retry in 10s")
                         await asyncio.sleep(10)
@@ -203,7 +203,6 @@ async def stream_prices():
                             data = json.loads(line_str)
                         except:
                             continue
-                        # skip heartbeats
                         if data.get("type") == "HEARTBEAT":
                             continue
                         if "bids" in data:
