@@ -12,7 +12,6 @@ load_dotenv()
 API_KEY = os.getenv("OANDA_API_KEY")
 ACCOUNT_ID = os.getenv("OANDA_ACCOUNT_ID")
 REST = "https://api-fxpractice.oanda.com/v3"
-STREAM = f"https://stream-fxpractice.oanda.com/v3/accounts/{ACCOUNT_ID}/pricing/stream"
 
 INSTR = ["EUR_USD", "GBP_USD", "USD_JPY", "USD_CHF", "AUD_USD", "EUR_JPY"]  # Added EUR/JPY
 
@@ -26,8 +25,8 @@ ATR_PERIOD = 14
 RISK_PER_TRADE = 0.01
 SL_MULTIPLIER = 1.5
 TP_MULTIPLIER = 3
-COOLDOWN = 1  # in minutes, shortened for testing
-TIMEFRAME = "5min"  # changed to 5 minutes for quicker trades
+COOLDOWN = 1  # in minutes
+TIMEFRAME = "5min"  # shorter timeframe for quicker trades
 
 # ================= STATE =================
 state = {
@@ -57,7 +56,6 @@ def add_indicators(df):
     df['prev_close'] = df['close'].shift(1)
     df['tr'] = np.maximum(df['high'] - df['low'], np.maximum(abs(df['high'] - df['prev_close']), abs(df['low'] - df['prev_close'])))
     df['atr'] = df['tr'].rolling(ATR_PERIOD).mean()
-
     return df
 
 def get_signal(df):
@@ -71,13 +69,12 @@ def get_signal(df):
         print(f"EUR/JPY Signal Debug: MACD={last['macd']}, Signal={last['macd_signal']}, EMA50={last['ema50']}, EMA200={last['ema200']}, RSI={last['rsi']}")
 
     if macd_crossover and ema_alignment and rsi_condition:
-        print(f"Signal: Buy (long) for EUR/JPY")
+        print(f"Signal: Buy (long) for {df.name}")
         return 1
     elif not macd_crossover and not ema_alignment and rsi_condition:
-        print(f"Signal: Sell (short) for EUR/JPY")
+        print(f"Signal: Sell (short) for {df.name}")
         return -1
     
-    print(f"Signal: No trade for EUR/JPY")
     return 0
 
 # ================= RISK CALC =================
@@ -154,7 +151,7 @@ async def process_tick(session, tick):
         else:
             new_row = pd.DataFrame([[now, price, price, price, price]], columns=["time", "open", "high", "low", "close"])
             df = pd.concat([df, new_row], ignore_index=True)
-        df.name = pair  # for debugging
+        df.name = pair
         state['price'][pair] = df.tail(300)
 
         if len(df) < ATR_PERIOD + 10:
@@ -171,21 +168,26 @@ async def process_tick(session, tick):
 async def stream_prices():
     headers = {"Authorization": f"Bearer {API_KEY}"}
     params = {"instruments": ",".join(INSTR)}
+    
     async with aiohttp.ClientSession(headers=headers) as session:
         while True:
             try:
+                print("Connecting to OANDA stream...")
                 async with session.get(f"{REST}/accounts/{ACCOUNT_ID}/pricing/stream",
-                                       params=params) as r:
-                    print("Streaming connected...")
+                                       params=params, timeout=None) as r:
+                    print("Streaming connected...")  # Only once per connection
                     async for line in r.content:
                         if not line:
                             continue
-                        data = json.loads(line.decode("utf-8"))
+                        line_str = line.decode("utf-8").strip()
+                        if not line_str:
+                            continue
+                        data = json.loads(line_str)
                         if "bids" in data:
                             asyncio.create_task(process_tick(session, data))
             except Exception as e:
                 print("Stream error:", e)
-                await asyncio.sleep(5)
+                await asyncio.sleep(5)  # wait before reconnecting
 
 # ================= MAIN =================
 if __name__ == "__main__":
