@@ -26,7 +26,7 @@ ATR_PERIOD = 14
 RISK_PER_TRADE = 0.01
 SL_MULTIPLIER = 1.5
 TP_MULTIPLIER = 3
-COOLDOWN = 4  # in candles
+COOLDOWN = 1  # in candles, changed for testing
 TIMEFRAME = "15min"  # main timeframe for trend
 
 # ================= STATE =================
@@ -75,12 +75,18 @@ def get_signal(df):
     rsi_overbought = last['rsi'] > 70
     rsi_oversold = last['rsi'] < 30
 
+    # Print values for debugging
+    print(f"MACD: {last['macd']}, Signal: {last['macd_signal']}, EMA50: {last['ema50']}, EMA200: {last['ema200']}, RSI: {last['rsi']}")
+    
     # Trading signals
     if macd_crossover and ema_alignment and not rsi_overbought:
+        print(f"Signal: Buy (long) for {df.name}")
         return 1  # Buy signal (long)
     elif not macd_crossover and not ema_alignment and not rsi_oversold:
+        print(f"Signal: Sell (short) for {df.name}")
         return -1  # Sell signal (short)
     
+    print(f"Signal: No trade for {df.name}")
     return 0  # No signal
 
 # ================= RISK CALC =================
@@ -103,6 +109,10 @@ async def get_account_info(session):
 async def place_order(session, pair, price, atr, signal):
     nav, margin_avail = await get_account_info(session)
     units = calculate_units(nav, margin_avail, atr, RISK_PER_TRADE)
+    
+    # Log units calculated
+    print(f"Calculated units for {pair}: {units} | NAV: {nav} | Margin: {margin_avail} | ATR: {atr}")
+
     if units == 0:
         print(f"{datetime.now()} | Skipping {pair}, insufficient margin")
         return
@@ -115,6 +125,9 @@ async def place_order(session, pair, price, atr, signal):
     if abs(price - stop_loss) < min_dist: stop_loss = price + (min_dist if signal == -1 else -min_dist)
     if abs(price - take_profit) < min_dist: take_profit = price + (3*min_dist if signal == 1 else -3*min_dist)
 
+    # Log stop loss and take profit levels
+    print(f"Stop Loss: {stop_loss} | Take Profit: {take_profit} | Price: {price}")
+    
     payload = {
         "order": {
             "instrument": pair,
@@ -163,6 +176,7 @@ async def process_tick(session, tick):
         state['last_signal'][pair] = sig
 
         # Trade only if no position and cooldown passed
+        print(f"Checking trade conditions for {pair} | Signal: {sig} | Current Position: {state['pos'][pair]}")
         if sig != 0 and state['pos'][pair] == 0 and (datetime.utcnow().timestamp() - state['last_trade_time'][pair]) > COOLDOWN * 60:
             await place_order(session, pair, price, df['atr'].iloc[-1], sig)
 
