@@ -33,28 +33,43 @@ state = {
 
 # ================= INDICATORS =================
 def add_indicators(df):
+    # EMA calculation
     df['ema50'] = df['close'].ewm(span=EMA_FAST, adjust=False).mean()
     df['ema200'] = df['close'].ewm(span=EMA_SLOW, adjust=False).mean()
+    
+    # RSI calculation
     delta = df['close'].diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
     avg_gain = gain.ewm(alpha=1/RSI_PERIOD, adjust=False).mean()
     avg_loss = loss.ewm(alpha=1/RSI_PERIOD, adjust=False).mean()
     df['rsi'] = 100-(100/(1+avg_gain/avg_loss))
+
+    # ATR calculation
     df['prev_close'] = df['close'].shift(1)
     df['tr'] = np.maximum(df['high']-df['low'],
                           np.maximum(abs(df['high']-df['prev_close']),
                                      abs(df['low']-df['prev_close'])))
     df['atr'] = df['tr'].rolling(ATR_PERIOD).mean()
+    
+    # MACD calculation
+    df['macd_line'] = df['close'].ewm(span=12, adjust=False).mean() - df['close'].ewm(span=26, adjust=False).mean()
+    df['macd_signal'] = df['macd_line'].ewm(span=9, adjust=False).mean()
+
     return df
 
 def get_signal(df):
     last = df.iloc[-1]
-    if last['ema50'] > last['ema200'] and last['rsi'] > 50:
+    
+    # Long signal: MACD crosses above signal line, EMA50 above EMA200, RSI > 50
+    if last['macd_line'] > last['macd_signal'] and last['ema50'] > last['ema200'] and last['rsi'] > 50:
         return 1  # long
-    elif last['ema50'] < last['ema200'] and last['rsi'] < 50:
+
+    # Short signal: MACD crosses below signal line, EMA50 below EMA200, RSI < 50
+    elif last['macd_line'] < last['macd_signal'] and last['ema50'] < last['ema200'] and last['rsi'] < 50:
         return -1  # short
-    return 0
+    
+    return 0  # no trade
 
 # ================= RISK CALC =================
 def calculate_units(nav, margin_avail, atr, risk=RISK_PER_TRADE):
@@ -152,11 +167,11 @@ async def stream_prices():
                         if not line: continue
                         data = json.loads(line.decode("utf-8"))
                         if "bids" in data:
-                            asyncio.create_task(process_tick(session,data))
+                            asyncio.create_task(process_tick(session, data))
             except Exception as e:
                 print("Stream error:", e)
                 await asyncio.sleep(5)
 
 # ================= MAIN =================
-if __name__=="__main__":
+if __name__ == "__main__":
     asyncio.run(stream_prices())
