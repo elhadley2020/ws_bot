@@ -26,8 +26,8 @@ ATR_PERIOD = 14
 RISK_PER_TRADE = 0.01
 SL_MULTIPLIER = 1.5
 TP_MULTIPLIER = 3
-COOLDOWN = 1  # in candles, changed for testing
-TIMEFRAME = "15min"  # main timeframe for trend
+COOLDOWN = 1  # in minutes, shortened for testing
+TIMEFRAME = "5min"  # changed to 5 minutes for quicker trades
 
 # ================= STATE =================
 state = {
@@ -41,11 +41,9 @@ state = {
 
 # ================= INDICATORS =================
 def add_indicators(df):
-    # EMA
     df['ema50'] = df['close'].ewm(span=EMA_FAST, adjust=False).mean()
     df['ema200'] = df['close'].ewm(span=EMA_SLOW, adjust=False).mean()
     
-    # RSI
     delta = df['close'].diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
@@ -53,11 +51,9 @@ def add_indicators(df):
     avg_loss = loss.ewm(alpha=1/RSI_PERIOD, adjust=False).mean()
     df['rsi'] = 100 - (100 / (1 + avg_gain / avg_loss))
     
-    # MACD
     df['macd'] = df['close'].ewm(span=MACD_SHORT, adjust=False).mean() - df['close'].ewm(span=MACD_LONG, adjust=False).mean()
     df['macd_signal'] = df['macd'].ewm(span=MACD_SIGNAL, adjust=False).mean()
     
-    # ATR (Average True Range)
     df['prev_close'] = df['close'].shift(1)
     df['tr'] = np.maximum(df['high'] - df['low'], np.maximum(abs(df['high'] - df['prev_close']), abs(df['low'] - df['prev_close'])))
     df['atr'] = df['tr'].rolling(ATR_PERIOD).mean()
@@ -67,28 +63,22 @@ def add_indicators(df):
 def get_signal(df):
     last = df.iloc[-1]
     
-    # Check for MACD crossover (bullish or bearish)
-    macd_crossover = last['macd'] > last['macd_signal']
-    # Check for EMA alignment (bullish or bearish trend)
-    ema_alignment = last['ema50'] > last['ema200']
-    # Check for RSI conditions
-    rsi_overbought = last['rsi'] > 70
-    rsi_oversold = last['rsi'] < 30
+    macd_crossover = last['macd'] > last['macd_signal']  # Relaxed MACD condition
+    ema_alignment = last['ema50'] > last['ema200']       # EMA alignment
+    rsi_condition = last['rsi'] > 50                     # Relaxed RSI condition
 
-    # Debugging print for EUR/JPY specifically
-    if df.name == 'EUR_JPY':  # Only print for EUR/JPY to avoid clutter
-        print(f"EUR/JPY Signal Debugging: MACD: {last['macd']}, Signal: {last['macd_signal']}, EMA50: {last['ema50']}, EMA200: {last['ema200']}, RSI: {last['rsi']}")
+    if df.name == 'EUR_JPY':  # Debugging for EUR/JPY
+        print(f"EUR/JPY Signal Debug: MACD={last['macd']}, Signal={last['macd_signal']}, EMA50={last['ema50']}, EMA200={last['ema200']}, RSI={last['rsi']}")
 
-    # Trading signals
-    if macd_crossover and ema_alignment and not rsi_overbought:
+    if macd_crossover and ema_alignment and rsi_condition:
         print(f"Signal: Buy (long) for EUR/JPY")
-        return 1  # Buy signal (long)
-    elif not macd_crossover and not ema_alignment and not rsi_oversold:
+        return 1
+    elif not macd_crossover and not ema_alignment and rsi_condition:
         print(f"Signal: Sell (short) for EUR/JPY")
-        return -1  # Sell signal (short)
+        return -1
     
     print(f"Signal: No trade for EUR/JPY")
-    return 0  # No signal
+    return 0
 
 # ================= RISK CALC =================
 def calculate_units(nav, margin_avail, atr, risk=RISK_PER_TRADE):
@@ -111,9 +101,7 @@ async def place_order(session, pair, price, atr, signal):
     nav, margin_avail = await get_account_info(session)
     units = calculate_units(nav, margin_avail, atr, RISK_PER_TRADE)
     
-    # Log units calculated
-    print(f"EUR/JPY - Calculated units: {units} | NAV: {nav} | Margin Available: {margin_avail} | ATR: {atr}")
-    
+    print(f"{pair} - Calculated units: {units} | NAV: {nav} | Margin: {margin_avail} | ATR: {atr}")
     if units == 0:
         print(f"{datetime.now()} | Skipping {pair}, insufficient margin")
         return
@@ -121,14 +109,12 @@ async def place_order(session, pair, price, atr, signal):
     stop_loss = price - SL_MULTIPLIER*atr if signal == 1 else price + SL_MULTIPLIER*atr
     take_profit = price + TP_MULTIPLIER*atr if signal == 1 else price - TP_MULTIPLIER*atr
 
-    # Ensure minimum SL/TP distance
     min_dist = 0.01 if "JPY" in pair else 0.0001
     if abs(price - stop_loss) < min_dist: stop_loss = price + (min_dist if signal == -1 else -min_dist)
     if abs(price - take_profit) < min_dist: take_profit = price + (3*min_dist if signal == 1 else -3*min_dist)
 
-    # Log stop loss and take profit levels
-    print(f"EUR/JPY - Stop Loss: {stop_loss} | Take Profit: {take_profit} | Price: {price}")
-    
+    print(f"{pair} - SL: {stop_loss} | TP: {take_profit} | Price: {price}")
+
     payload = {
         "order": {
             "instrument": pair,
@@ -168,6 +154,7 @@ async def process_tick(session, tick):
         else:
             new_row = pd.DataFrame([[now, price, price, price, price]], columns=["time", "open", "high", "low", "close"])
             df = pd.concat([df, new_row], ignore_index=True)
+        df.name = pair  # for debugging
         state['price'][pair] = df.tail(300)
 
         if len(df) < ATR_PERIOD + 10:
@@ -176,7 +163,6 @@ async def process_tick(session, tick):
         sig = get_signal(df)
         state['last_signal'][pair] = sig
 
-        # Trade only if no position and cooldown passed
         print(f"Checking trade conditions for {pair} | Signal: {sig} | Current Position: {state['pos'][pair]}")
         if sig != 0 and state['pos'][pair] == 0 and (datetime.utcnow().timestamp() - state['last_trade_time'][pair]) > COOLDOWN * 60:
             await place_order(session, pair, price, df['atr'].iloc[-1], sig)
@@ -188,7 +174,7 @@ async def stream_prices():
     async with aiohttp.ClientSession(headers=headers) as session:
         while True:
             try:
-                async with session.get(f"https://stream-fxpractice.oanda.com/v3/accounts/{ACCOUNT_ID}/pricing/stream",
+                async with session.get(f"{REST}/accounts/{ACCOUNT_ID}/pricing/stream",
                                        params=params) as r:
                     print("Streaming connected...")
                     async for line in r.content:
