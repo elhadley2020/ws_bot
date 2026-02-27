@@ -180,14 +180,20 @@ async def stream_prices():
     headers = {"Authorization": f"Bearer {API_KEY}"}
     params = {"instruments": ",".join(INSTR)}
 
-    async with aiohttp.ClientSession(headers=headers) as session:
+    timeout = aiohttp.ClientTimeout(sock_connect=10, sock_read=None)
+    async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
         while True:
             try:
                 print("Connecting to OANDA stream...")
                 async with session.get(f"{REST}/accounts/{ACCOUNT_ID}/pricing/stream",
-                                       params=params, timeout=None) as r:
+                                       params=params) as resp:
+                    if resp.status != 200:
+                        print(f"Stream error: HTTP {resp.status}, retry in 10s")
+                        await asyncio.sleep(10)
+                        continue
+
                     print("Streaming connected...")
-                    async for line in r.content:
+                    async for line in resp.content:
                         if not line:
                             continue
                         line_str = line.decode("utf-8").strip()
@@ -197,10 +203,13 @@ async def stream_prices():
                             data = json.loads(line_str)
                         except:
                             continue
+                        # skip heartbeats
+                        if data.get("type") == "HEARTBEAT":
+                            continue
                         if "bids" in data:
                             asyncio.create_task(process_tick(session, data))
             except Exception as e:
-                print(f"Stream error: {e}. Reconnecting in 10s...")
+                print(f"Stream exception: {e}. Reconnecting in 10s...")
                 await asyncio.sleep(10)
 
 # ================= MAIN =================
