@@ -14,7 +14,7 @@ ACCOUNT_ID = os.getenv("OANDA_ACCOUNT_ID")
 REST = "https://api-fxpractice.oanda.com/v3"
 STREAM = f"https://stream-fxpractice.oanda.com/v3/accounts/{ACCOUNT_ID}/pricing/stream"
 
-INSTR = ["EUR_USD", "GBP_USD", "USD_JPY", "USD_CHF", "AUD_USD"]
+INSTR = ["EUR_USD", "GBP_USD", "USD_JPY", "USD_CHF", "AUD_USD", "EUR_JPY"]  # Added EUR/JPY
 
 # Indicators & risk
 EMA_FAST, EMA_SLOW = 50, 200
@@ -31,7 +31,7 @@ TIMEFRAME = "15min"  # main timeframe for trend
 
 # ================= STATE =================
 state = {
-    "price": {p: pd.DataFrame(columns=["time","open","high","low","close"]) for p in INSTR},
+    "price": {p: pd.DataFrame(columns=["time", "open", "high", "low", "close"]) for p in INSTR},
     "last_signal": {p: 0 for p in INSTR},
     "pos": {p: 0 for p in INSTR},
     "entry": {p: 0.0 for p in INSTR},
@@ -75,18 +75,19 @@ def get_signal(df):
     rsi_overbought = last['rsi'] > 70
     rsi_oversold = last['rsi'] < 30
 
-    # Print values for debugging
-    print(f"MACD: {last['macd']}, Signal: {last['macd_signal']}, EMA50: {last['ema50']}, EMA200: {last['ema200']}, RSI: {last['rsi']}")
-    
+    # Debugging print for EUR/JPY specifically
+    if df.name == 'EUR_JPY':  # Only print for EUR/JPY to avoid clutter
+        print(f"EUR/JPY Signal Debugging: MACD: {last['macd']}, Signal: {last['macd_signal']}, EMA50: {last['ema50']}, EMA200: {last['ema200']}, RSI: {last['rsi']}")
+
     # Trading signals
     if macd_crossover and ema_alignment and not rsi_overbought:
-        print(f"Signal: Buy (long) for {df.name}")
+        print(f"Signal: Buy (long) for EUR/JPY")
         return 1  # Buy signal (long)
     elif not macd_crossover and not ema_alignment and not rsi_oversold:
-        print(f"Signal: Sell (short) for {df.name}")
+        print(f"Signal: Sell (short) for EUR/JPY")
         return -1  # Sell signal (short)
     
-    print(f"Signal: No trade for {df.name}")
+    print(f"Signal: No trade for EUR/JPY")
     return 0  # No signal
 
 # ================= RISK CALC =================
@@ -111,8 +112,8 @@ async def place_order(session, pair, price, atr, signal):
     units = calculate_units(nav, margin_avail, atr, RISK_PER_TRADE)
     
     # Log units calculated
-    print(f"Calculated units for {pair}: {units} | NAV: {nav} | Margin: {margin_avail} | ATR: {atr}")
-
+    print(f"EUR/JPY - Calculated units: {units} | NAV: {nav} | Margin Available: {margin_avail} | ATR: {atr}")
+    
     if units == 0:
         print(f"{datetime.now()} | Skipping {pair}, insufficient margin")
         return
@@ -126,7 +127,7 @@ async def place_order(session, pair, price, atr, signal):
     if abs(price - take_profit) < min_dist: take_profit = price + (3*min_dist if signal == 1 else -3*min_dist)
 
     # Log stop loss and take profit levels
-    print(f"Stop Loss: {stop_loss} | Take Profit: {take_profit} | Price: {price}")
+    print(f"EUR/JPY - Stop Loss: {stop_loss} | Take Profit: {take_profit} | Price: {price}")
     
     payload = {
         "order": {
